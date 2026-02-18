@@ -1,0 +1,296 @@
+# ==========================================================
+ Training script
+
+
+import os, re, time, random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from scipy.io import loadmat
+
+# -------------------------
+# REPRODUCIBILITY
+# -------------------------
+SEED = int(os.environ.get("SEED", "42"))
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# -------------------------
+# CONFIG (DO NOT HARD-CODE PRIVATE PATHS)
+# Set as environment variables when running:
+#   export CT_DIR=/path/to/ct
+#   export MASK_DIR=/path/to/masks
+# -------------------------
+CT_DIR = os.environ.get("CT_DIR", "./data/ct_mat")
+MASK_DIR = os.environ.get("MASK_DIR", "./data/masks_mat")
+
+OUT_SHAPE = tuple(map(int, os.environ.get("OUT_SHAPE", "128,128,128").split(",")))
+EPOCHS = int(os.environ.get("EPOCHS", "15"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1"))
+LR = float(os.environ.get("LR", "1e-3"))
+TRAIN_SPLIT = float(os.environ.get("TRAIN_SPLIT", "0.9"))
+OUT_DIR = os.environ.get("OUT_DIR", "./outputs")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# -------------------------
+# DATASET
+# -------------------------
+def extract_field(mat_entry, field):
+    return mat_entry[0, 0][field]
+
+class LungMatDataset(Dataset):
+    def __init__(self, ct_dir, mask_dir, out_shape=(128,128,128)):
+        self.out_shape = out_shape
+        self.pairs = []
+
+        if not os.path.isdir(ct_dir):
+            raise FileNotFoundError(f"CT_DIR not found: {ct_dir}")
+        if not os.path.isdir(mask_dir):
+            raise FileNotFoundError(f"MASK_DIR not found: {mask_dir}")
+
+        for f in sorted(os.listdir(ct_dir)):
+            if not f.endswith(".mat"):
+                continue
+            pid_match = re.findall(r"BRUCI\d+", f)
+            if not pid_match:
+                continue
+            pid = pid_match[0]
+            ct_file = os.path.join(ct_dir, f)
+            mask_file = os.path.join(mask_dir, f"{pid}_LungMasks_ALUK.mat")
+            if os.path.exists(mask_file):
+                self.pairs.append((ct_file, mask_file))
+
+        print(f"Found {len(self.pairs)} matched cases.")
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        ct_path, mask_path = self.pairs[idx]
+
+        ct = extract_field(loadmat(ct_path)["imagingData"], "dataVolume")
+        left = extract_field(loadmat(mask_path)["lungMasks"], "leftLung")
+        right = extract_field(loadmat(mask_path)["lungMasks"], "rightLung")
+
+        mask = np.zeros_like(left, dtype=np.uint8)
+        mask[left == 1] = 1
+        mask[right == 1] = 2
+
+        ct = torch.tensor(ct).float().unsqueeze(0).unsqueeze(0)      # (1,1,D,H,W)
+        mask = torch.tensor(mask).long().unsqueeze(0).unsqueeze(0)   # (1,1,D,H,W)
+
+        ct = F.interpolate(ct, self.out_shape, mode="trilinear", align_corners=False)
+        mask = F.interpolate(mask.float(), self.out_shape, mode="nearest").long()
+
+        # z-score normalisation (per-volume)
+        ct = (ct - ct.mean()) / (ct.std() + 1e-6)
+
+        return ct[0], mask[0, 0]  # (1,D,H,W), (D,H,W)
+
+# -------------------------
+# SINUSOIDAL POSITIONAL ENCODING 
+# -------------------------
+def sine_encoding(x, num_bands=6, base_list=(0.5, 1.0, 2.0)):
+    b, c, d, h, w = x.shape
+    z = torch.linspace(-1, 1, d, device=x.device).view(1, d, 1, 1).expand(b, d, h, w)
+    y = torch.linspace(-1, 1, h, device=x.device).view(1, 1, h, 1).expand(b, d, h, w)
+    x_ = torch.linspace(-1, 1, w, device=x.device).view(1, 1, 1, w).expand(b, d, h, w)
+
+    enc = []
+    for base in base_list:
+        for freq in range(num_bands):
+            scale = base * (2.0 ** freq) * np.pi
+            for fn in (torch.sin, torch.cos):
+                enc.append(fn(scale * x_))
+                enc.append(fn(scale * y))
+                enc.append(fn(scale * z))
+
+    pos = torch.stack(enc, dim=1)  # (b, Cpos, d, h, w)
+
+    # Match channels to input channels
+    if pos.shape[1] >= c:
+        pos = pos[:, :c]
+    else:
+        pos = F.pad(pos, (0,0,0,0,0,0,0, c - pos.shape[1]))
+
+    return x + pos
+
+# -------------------------
+# MODEL # -------------------------
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+class UNet3DDeep(nn.Module):
+    def __init__(self, in_ch=1, out_ch=3):
+        super().__init__()
+        self.pool = nn.MaxPool3d(2)
+
+        # Encoder
+        self.enc1 = DoubleConv(in_ch, 32)
+        self.enc2 = DoubleConv(32, 64)
+        self.enc3 = DoubleConv(64, 128)
+        self.enc4 = DoubleConv(128, 256)
+
+        # Bottleneck (C=512)
+        self.bottleneck = DoubleConv(256, 512)
+
+        # Decoder
+        self.up4 = nn.ConvTranspose3d(512, 256, 2, stride=2)
+        self.dec4 = DoubleConv(256 + 256, 256)
+
+        self.up3 = nn.ConvTranspose3d(256, 128, 2, stride=2)
+        self.dec3 = DoubleConv(128 + 128, 128)
+
+        self.up2 = nn.ConvTranspose3d(128, 64, 2, stride=2)
+        self.dec2 = DoubleConv(64 + 64, 64)
+
+        self.up1 = nn.ConvTranspose3d(64, 32, 2, stride=2)
+        self.dec1 = DoubleConv(32 + 32, 32)
+
+        self.out = nn.Conv3d(32, out_ch, 1)
+
+    def forward(self, x):
+        # positional encoding at input
+        x = sine_encoding(x, num_bands=6, base_list=(0.5, 1.0, 2.0))
+
+        e1 = self.enc1(x)              # 32
+        e2 = self.enc2(self.pool(e1))  # 64
+        e3 = self.enc3(self.pool(e2))  # 128
+        e4 = self.enc4(self.pool(e3))  # 256
+
+        b  = self.bottleneck(self.pool(e4))  # 512
+
+        d4 = self.up4(b)
+        d4 = self.dec4(torch.cat([d4, e4], dim=1))  # 256
+
+        d3 = self.up3(d4)
+        d3 = self.dec3(torch.cat([d3, e3], dim=1))  # 128
+
+        d2 = self.up2(d3)
+        d2 = self.dec2(torch.cat([d2, e2], dim=1))  # 64
+
+        d1 = self.up1(d2)
+        d1 = self.dec1(torch.cat([d1, e1], dim=1))  # 32
+
+        return self.out(d1)
+
+# -------------------------
+# LOSS + METRIC (LEFT/RIGHT CLASSES 1..2)
+# -------------------------
+class DiceCELoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss()
+
+    def forward(self, logits, target):
+        ce = self.ce(logits, target)
+
+        probs = F.softmax(logits, dim=1)
+        dice = 0.0
+        for c in (1, 2):
+            p = probs[:, c]
+            t = (target == c).float()
+            inter = (p * t).sum()
+            union = p.sum() + t.sum()
+            dice += 1.0 - (2.0 * inter + 1e-6) / (union + 1e-6)
+
+        return ce + dice
+
+@torch.no_grad()
+def mean_dice(logits, target):
+    pred = torch.argmax(F.softmax(logits, dim=1), dim=1)
+    scores = []
+    for c in (1, 2):
+        p = (pred == c).float()
+        t = (target == c).float()
+        inter = (p * t).sum()
+        union = p.sum() + t.sum()
+        scores.append((2.0 * inter / (union + 1e-6)).item())
+    return float(np.mean(scores))
+
+# -------------------------
+# TRAIN / VAL
+# -------------------------
+ds = LungMatDataset(CT_DIR, MASK_DIR, out_shape=OUT_SHAPE)
+if len(ds) < 2:
+    raise RuntimeError("Need at least 2 cases to split train/val.")
+
+train_len = int(TRAIN_SPLIT * len(ds))
+train_ds = torch.utils.data.Subset(ds, range(train_len))
+val_ds = torch.utils.data.Subset(ds, range(train_len, len(ds)))
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+model = UNet3DDeep(in_ch=1, out_ch=3).to(device)
+opt = torch.optim.Adam(model.parameters(), lr=LR)
+loss_fn = DiceCELoss()
+
+best_val = -1.0
+epoch_log = []
+t0 = time.time()
+
+for epoch in range(1, EPOCHS + 1):
+    model.train()
+    running = 0.0
+
+    for ct, mask in train_loader:
+        ct, mask = ct.to(device), mask.to(device)
+
+        logits = model(ct)
+        loss = loss_fn(logits, mask)
+
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+        running += loss.item()
+
+    model.eval()
+    vals = []
+    for ct, mask in val_loader:
+        ct, mask = ct.to(device), mask.to(device)
+        logits = model(ct)
+        vals.append(mean_dice(logits, mask))
+
+    mean_val = float(np.mean(vals)) if len(vals) else 0.0
+    mean_train_loss = running / max(1, len(train_loader))
+
+    print(f"Epoch {epoch:02d}/{EPOCHS} | train loss {mean_train_loss:.4f} | val dice {mean_val:.4f}")
+    epoch_log.append((epoch, mean_train_loss, mean_val))
+
+    # Save best model only (journal/GitHub friendly)
+    if mean_val > best_val:
+        best_val = mean_val
+        torch.save(model.state_dict(), os.path.join(OUT_DIR, "model_best.pth"))
+
+# Save a simple CSV log
+log_path = os.path.join(OUT_DIR, "epoch_log.csv")
+with open(log_path, "w") as f:
+    f.write("epoch,train_loss,val_dice\n")
+    for ep, tr, vd in epoch_log:
+        f.write(f"{ep},{tr:.6f},{vd:.6f}\n")
+
+elapsed = time.time() - t0
+print(f"\nDone. Best val dice: {best_val:.4f}")
+print(f"Outputs saved to: {OUT_DIR}")
+print(f"Log: {log_path}")
