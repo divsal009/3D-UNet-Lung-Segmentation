@@ -41,10 +41,17 @@ Available via The Cancer Imaging Archive (TCIA).
 
 ## Reproducibility
 
-- Fixed random seed  
-- Deterministic training configuration  
-- Full training pipeline included  
-- Model weights given in external dataset validation notebook
+This repository ensures experimental reproducibility through:
+
+Fixed random seed across NumPy and PyTorch
+
+Deterministic training configuration to minimise stochastic variability
+
+Complete training and inference pipeline implementation
+
+Publicly available trained model weights (model_epoch15.pth)
+
+External dataset validation provided via a dedicated validation notebook
 
 ---
 
