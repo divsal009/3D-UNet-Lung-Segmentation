@@ -44,7 +44,7 @@ Available via The Cancer Imaging Archive (TCIA).
 - Fixed random seed  
 - Deterministic training configuration  
 - Full training pipeline included  
-- Model weights available upon request  
+- Model weights given in external dataset validation notebook
 
 ---
 
