@@ -6,3 +6,74 @@ pydicom
 rt-utils
 ipywidgets
 ipyfilechooser
+# ==========================================================
+# PROFESSIONAL GITHUB REPOSITORY TEXT GENERATOR
+# For research code release / journal reproducibility support
+# Creates:
+#   README.md
+#   requirements.txt
+#   CODE_AVAILABILITY.md
+#   DATA_AVAILABILITY.md
+#   REPRODUCIBILITY.md
+#   CITATION.cff
+# ==========================================================
+
+import os
+
+PROJECT_DIR = "/content/github_repository_text"
+os.makedirs(PROJECT_DIR, exist_ok=True)
+
+README = """# Multilingual and Code-Mixed Sentiment and Domain Classification
+
+This repository provides a reproducible experimental pipeline for multilingual and code-mixed text classification. The project evaluates Hinglish domain classification, English restaurant sentiment classification, and Hindi movie review sentiment classification using classical machine learning and multilingual transformer-based baselines.
+
+The repository is designed to support transparent experimentation, reproducibility, and code availability for an associated research manuscript.
+
+---
+
+## Overview
+
+Multilingual and code-mixed natural language processing remains challenging because user-generated text often combines multiple languages, scripts, and informal linguistic patterns. This repository provides a reproducible workflow for evaluating classification models across Hinglish, English, and Hindi datasets.
+
+The experiments cover three tasks:
+
+- Hinglish domain / intent classification
+- English binary sentiment classification
+- Hindi multi-class sentiment classification
+
+The pipeline includes dataset download, preprocessing, exploratory analysis, model training, evaluation, visualisation, statistical testing, error analysis, and computational efficiency reporting.
+
+---
+
+## Datasets
+
+The following publicly available datasets are used in this project.
+
+### Hinglish TOP Dataset
+
+- Source: Kaggle
+- Link: https://www.kaggle.com/datasets/nexuswho/hinglish-top-dataset
+- Task: Hinglish / code-mixed domain classification
+- Main file: `Human Annotated Data/train.tsv`
+- Main columns: `en_query`, `cs_query`, `en_parse`, `cs_parse`, `domain`
+
+### Restaurant Reviews Dataset
+
+- Source: Kaggle
+- Link: https://www.kaggle.com/datasets/d4rklucif3r/restaurant-reviews
+- Task: English binary sentiment classification
+- Main file: `Restaurant_Reviews.tsv`
+- Main columns: `Review`, `Liked`
+
+### Hindi Movie Reviews Dataset
+
+- Source: Kaggle
+- Link: https://www.kaggle.com/datasets/disisbig/hindi-movie-reviews-dataset
+- Task: Hindi movie review sentiment classification
+- Main file: `train.csv`
+- Main columns: `text`, `experience`
+
+No private, restricted, or personally identifiable data are included in this repository.
+
+---
+
